@@ -16,3 +16,4 @@
 # Build directories
 build/
 cmake-build-*/
+forge-test/forge-client
