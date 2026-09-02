@@ -1,0 +1,18 @@
+# Object files
+*.o
+*.obj
+
+# Executables
+*.exe
+*.out
+
+# Libraries
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Build directories
+build/
+cmake-build-*/
