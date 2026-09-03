@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <netinet/in.h>
@@ -9,6 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+
 
 bool send_all(int socket, const void* buffer, size_t bytes) {
     const char* ptr = static_cast<const char*>(buffer);
@@ -27,6 +29,7 @@ bool send_all(int socket, const void* buffer, size_t bytes) {
     return true;
 }
 
+
 bool recv_all(int socket, void* buffer, size_t bytes) {
     char* ptr = static_cast<char*>(buffer);
 
@@ -44,23 +47,13 @@ bool recv_all(int socket, void* buffer, size_t bytes) {
     return true;
 }
 
-int main(int argc, char* argv[]) {
 
-    if (argc != 2) {
-        std::cerr
-            << "Usage: ./forge-client <source.cpp>\n";
-
-        return 1;
-    }
-
+bool compile_remote(const std::string& file_path) {
     const int PORT = 9000;
 
-    std::string file_path =
-        argv[1];
-
-    // -------------------------------------------------
-    // Read source file
-    // -------------------------------------------------
+    // -----------------------------------------------------
+    // Read local source file
+    // -----------------------------------------------------
 
     std::ifstream input(
         file_path,
@@ -73,7 +66,7 @@ int main(int argc, char* argv[]) {
             << file_path
             << '\n';
 
-        return 1;
+        return false;
     }
 
     std::vector<char> file_data(
@@ -81,21 +74,32 @@ int main(int argc, char* argv[]) {
         std::istreambuf_iterator<char>()
     );
 
+    input.close();
+
     std::string filename =
         std::filesystem::path(file_path)
             .filename()
             .string();
 
-    // -------------------------------------------------
-    // Connect to worker
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
+    // Create TCP connection
+    // -----------------------------------------------------
 
     int sock =
-        socket(AF_INET, SOCK_STREAM, 0);
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            0
+        );
 
     if (sock < 0) {
-        std::cerr << "Failed creating socket\n";
-        return 1;
+        std::cerr
+            << "Failed creating socket for "
+            << filename
+            << '\n';
+
+        return false;
     }
 
     sockaddr_in worker{};
@@ -103,13 +107,22 @@ int main(int argc, char* argv[]) {
     worker.sin_family = AF_INET;
     worker.sin_port = htons(PORT);
 
+    // WSL mirrored networking
+    // -> Windows localhost
+    // -> VMware NAT forwarding
+    // -> Ubuntu VM worker
     inet_pton(
         AF_INET,
         "127.0.0.1",
         &worker.sin_addr
     );
 
-    std::cout << "Connecting to worker...\n";
+
+    std::cout
+        << "Connecting for "
+        << filename
+        << "...\n";
+
 
     if (connect(
             sock,
@@ -117,17 +130,19 @@ int main(int argc, char* argv[]) {
             sizeof(worker)
         ) < 0) {
 
-        std::cerr << "Could not connect\n";
+        std::cerr
+            << "Could not connect for "
+            << filename
+            << '\n';
 
         close(sock);
-        return 1;
+        return false;
     }
 
-    std::cout << "Connected\n";
 
-    // -------------------------------------------------
+    // -----------------------------------------------------
     // Send source filename length
-    // -------------------------------------------------
+    // -----------------------------------------------------
 
     uint32_t filename_length =
         static_cast<uint32_t>(
@@ -143,13 +158,19 @@ int main(int argc, char* argv[]) {
             sizeof(filename_length_network)
         )) {
 
-        std::cerr << "Failed sending filename length\n";
-        return 1;
+        std::cerr
+            << "Failed sending filename length for "
+            << filename
+            << '\n';
+
+        close(sock);
+        return false;
     }
 
-    // -------------------------------------------------
-    // Send filename
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
+    // Send source filename
+    // -----------------------------------------------------
 
     if (!send_all(
             sock,
@@ -157,13 +178,19 @@ int main(int argc, char* argv[]) {
             filename.size()
         )) {
 
-        std::cerr << "Failed sending filename\n";
-        return 1;
+        std::cerr
+            << "Failed sending filename "
+            << filename
+            << '\n';
+
+        close(sock);
+        return false;
     }
 
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
     // Send source file size
-    // -------------------------------------------------
+    // -----------------------------------------------------
 
     uint32_t file_size =
         static_cast<uint32_t>(
@@ -179,13 +206,19 @@ int main(int argc, char* argv[]) {
             sizeof(file_size_network)
         )) {
 
-        std::cerr << "Failed sending source size\n";
-        return 1;
+        std::cerr
+            << "Failed sending size for "
+            << filename
+            << '\n';
+
+        close(sock);
+        return false;
     }
 
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
     // Send source bytes
-    // -------------------------------------------------
+    // -----------------------------------------------------
 
     if (file_size > 0 &&
         !send_all(
@@ -194,23 +227,27 @@ int main(int argc, char* argv[]) {
             file_data.size()
         )) {
 
-        std::cerr << "Failed sending source file\n";
-        return 1;
+        std::cerr
+            << "Failed sending source file "
+            << filename
+            << '\n';
+
+        close(sock);
+        return false;
     }
+
 
     std::cout
         << "Sent "
         << filename
         << " ("
-        << file_data.size()
+        << file_size
         << " bytes)\n";
 
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
     // Receive compilation status
-    //
-    // 1 = success
-    // 0 = failure
-    // -------------------------------------------------
+    // -----------------------------------------------------
 
     uint32_t status_network;
 
@@ -221,30 +258,38 @@ int main(int argc, char* argv[]) {
         )) {
 
         std::cerr
-            << "Failed receiving compilation status\n";
+            << "Failed receiving status for "
+            << filename
+            << '\n';
 
         close(sock);
-        return 1;
+        return false;
     }
 
     uint32_t status =
         ntohl(status_network);
 
-    if (status == 0) {
 
+    if (status == 0) {
         std::cerr
-            << "Remote compilation failed\n";
+            << "Remote compilation failed: "
+            << filename
+            << '\n';
 
         close(sock);
-        return 1;
+        return false;
     }
 
-    std::cout
-        << "Remote compilation successful\n";
 
-    // -------------------------------------------------
-    // Receive object filename length
-    // -------------------------------------------------
+    std::cout
+        << "Remote compilation successful: "
+        << filename
+        << '\n';
+
+
+    // -----------------------------------------------------
+    // Receive returned object filename length
+    // -----------------------------------------------------
 
     uint32_t object_filename_length_network;
 
@@ -255,18 +300,22 @@ int main(int argc, char* argv[]) {
         )) {
 
         std::cerr
-            << "Failed receiving object filename length\n";
+            << "Failed receiving object filename length for "
+            << filename
+            << '\n';
 
         close(sock);
-        return 1;
+        return false;
     }
+
 
     uint32_t object_filename_length =
         ntohl(object_filename_length_network);
 
-    // -------------------------------------------------
-    // Receive object filename
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
+    // Receive returned object filename
+    // -----------------------------------------------------
 
     std::string object_filename(
         object_filename_length,
@@ -280,20 +329,24 @@ int main(int argc, char* argv[]) {
         )) {
 
         std::cerr
-            << "Failed receiving object filename\n";
+            << "Failed receiving object filename for "
+            << filename
+            << '\n';
 
         close(sock);
-        return 1;
+        return false;
     }
+
 
     object_filename =
         std::filesystem::path(object_filename)
             .filename()
             .string();
 
-    // -------------------------------------------------
-    // Receive object size
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
+    // Receive returned object size
+    // -----------------------------------------------------
 
     uint32_t object_size_network;
 
@@ -304,18 +357,22 @@ int main(int argc, char* argv[]) {
         )) {
 
         std::cerr
-            << "Failed receiving object size\n";
+            << "Failed receiving object size for "
+            << filename
+            << '\n';
 
         close(sock);
-        return 1;
+        return false;
     }
+
 
     uint32_t object_size =
         ntohl(object_size_network);
 
-    // -------------------------------------------------
-    // Receive actual .o bytes
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
+    // Receive object-file bytes
+    // -----------------------------------------------------
 
     std::vector<char> object_data(
         object_size
@@ -329,15 +386,18 @@ int main(int argc, char* argv[]) {
         )) {
 
         std::cerr
-            << "Failed receiving object file\n";
+            << "Failed receiving object file for "
+            << filename
+            << '\n';
 
         close(sock);
-        return 1;
+        return false;
     }
 
-    // -------------------------------------------------
-    // Save returned object file
-    // -------------------------------------------------
+
+    // -----------------------------------------------------
+    // Save returned .o file
+    // -----------------------------------------------------
 
     std::filesystem::create_directories(
         "returned"
@@ -347,6 +407,7 @@ int main(int argc, char* argv[]) {
         std::filesystem::path("returned")
         / object_filename;
 
+
     std::ofstream output(
         output_path,
         std::ios::binary
@@ -354,11 +415,14 @@ int main(int argc, char* argv[]) {
 
     if (!output) {
         std::cerr
-            << "Could not create returned object file\n";
+            << "Could not save "
+            << output_path.string()
+            << '\n';
 
         close(sock);
-        return 1;
+        return false;
     }
+
 
     output.write(
         object_data.data(),
@@ -367,14 +431,80 @@ int main(int argc, char* argv[]) {
 
     output.close();
 
+
     std::cout
-        << "Received object file: "
+        << "Received "
         << output_path.string()
         << " ("
-        << object_data.size()
+        << object_size
         << " bytes)\n";
 
+
     close(sock);
+
+    return true;
+}
+
+
+int main(int argc, char* argv[]) {
+
+    if (argc < 2) {
+        std::cerr
+            << "Usage: ./forge-client "
+            << "<source1.cpp> <source2.cpp> ...\n";
+
+        return 1;
+    }
+
+
+    // -----------------------------------------------------
+    // Start all remote compilation jobs concurrently
+    // -----------------------------------------------------
+
+    std::vector<std::future<bool>> jobs;
+
+
+    for (int i = 1; i < argc; ++i) {
+
+        std::string source =
+            argv[i];
+
+        jobs.push_back(
+            std::async(
+                std::launch::async,
+                compile_remote,
+                source
+            )
+        );
+    }
+
+
+    // -----------------------------------------------------
+    // Wait for every compilation job to finish
+    // -----------------------------------------------------
+
+    bool success = true;
+
+
+    for (auto& job : jobs) {
+
+        if (!job.get()) {
+            success = false;
+        }
+    }
+
+
+    if (!success) {
+
+        std::cerr
+            << "\nRemote build failed.\n";
+
+        return 1;
+    }
+
+
+    std::cout
+        << "\nAll remote compilations successful.\n";
 
     return 0;
 }
