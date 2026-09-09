@@ -17,3 +17,4 @@
 build/
 cmake-build-*/
 forge-test/forge-client
+.DS_Store
