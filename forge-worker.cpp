@@ -1,3 +1,4 @@
+#include <sys/wait.h>
 #include "job-support.h"
 #include <arpa/inet.h>
 
@@ -376,6 +377,41 @@ bool compute_sha256(
     return hash.size() == 64;
 }
 
+// Capture both compiler streams, but drain excess output to avoid blocking GCC.
+int run_compiler(const std::string& command, std::string& diagnostics) {
+    FILE* pipe = popen(("(" + command + ") 2>&1").c_str(), "r");
+    if (!pipe) {
+        diagnostics = "Could not start compiler\n";
+        return 127;
+    }
+    constexpr size_t limit = 1024 * 1024;
+    std::array<char, 4096> buffer{};
+    size_t count;
+    bool truncated = false;
+    while ((count = fread(buffer.data(), 1, buffer.size(), pipe)) != 0) {
+        size_t keep = std::min(count, limit - diagnostics.size());
+        diagnostics.append(buffer.data(), keep);
+        truncated |= keep != count;
+    }
+    bool read_error = ferror(pipe);
+    int status = pclose(pipe);
+    if (truncated) {
+        const std::string notice = "\n[compiler output truncated]\n";
+        diagnostics.resize(limit - notice.size());
+        diagnostics += notice;
+    }
+    if (status == -1 || read_error) return 127;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 127;
+}
+
+bool send_compiler_result(int fd, int exit_code, const std::string& diagnostics) {
+    return send_u32(fd, exit_code == 0 ? 3 : 2)
+        && send_u32(fd, static_cast<uint32_t>(exit_code))
+        && send_string(fd, diagnostics);
+}
+
 void handle_client(int client_fd) {
     SocketGuard connection(client_fd);
     if (!set_socket_timeouts(client_fd)) return;
@@ -656,6 +692,7 @@ void handle_client(int client_fd) {
         fs::exists(cache_path);
 
     fs::path object_to_send;
+    std::string diagnostics;
 
     if (cache_hit) {
         std::cout
@@ -709,7 +746,7 @@ void handle_client(int client_fd) {
             << '\n';
 
         int compile_result =
-            std::system(command.c_str());
+            run_compiler(command, diagnostics);
 
         if (compile_result != 0) {
             std::cerr
@@ -717,7 +754,7 @@ void handle_client(int client_fd) {
                 << relative_source.generic_string()
                 << '\n';
 
-            send_u32(client_fd, 0);
+            send_compiler_result(client_fd, compile_result, diagnostics);
 
             return;
         }
@@ -798,10 +835,8 @@ void handle_client(int client_fd) {
         return;
     }
 
-    if (!send_u32(
-            client_fd,
-            1
-        )) {
+    if (!(cache_hit ? send_u32(client_fd, 1)
+                    : send_compiler_result(client_fd, 0, diagnostics))) {
 
         return;
     }
@@ -947,8 +982,13 @@ private:
     bool stopping_ = false;
 };
 
-int main() {
-    const int PORT = 9000;
+int main(int argc, char* argv[]) {
+    int port = 9000;
+    if (argc != 1 && (argc != 3 || std::string(argv[1]) != "--port"
+                     || !parse_port(argv[2], port))) {
+        std::cerr << "Usage: ./forge-worker [--port 1-65535]\n";
+        return 1;
+    }
 
     fs::create_directories(
         "worker-jobs"
@@ -991,7 +1031,7 @@ int main() {
         INADDR_ANY;
 
     address.sin_port =
-        htons(PORT);
+        htons(port);
 
     if (
         bind(
@@ -1020,7 +1060,7 @@ int main() {
 
     std::cout
         << "Forge worker listening on port "
-        << PORT
+        << port
         << "...\n";
 
     std::cout

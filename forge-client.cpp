@@ -1,4 +1,5 @@
 #include "job-support.h"
+#include <syncstream>
 #include <arpa/inet.h>
 
 #include <array>
@@ -271,9 +272,10 @@ bool discover_dependencies(
 
 bool compile_remote(
     const std::string& source_argument,
-    const std::vector<std::string>& flags
+    const std::vector<std::string>& flags,
+    const std::string& host,
+    int port
 ) {
-    const int PORT = 9000;
 
     fs::path source =
         fs::path(source_argument).lexically_normal();
@@ -335,13 +337,12 @@ bool compile_remote(
 
     sockaddr_in worker{};
     worker.sin_family = AF_INET;
-    worker.sin_port = htons(PORT);
+    worker.sin_port = htons(port);
 
-    // Current single-worker setup:
-    // WSL mirrored networking -> Windows localhost -> VMware NAT forwarding.
+    // The command line accepts one worker's IPv4 address.
     inet_pton(
         AF_INET,
-        "127.0.0.1",
+        host.c_str(),
         &worker.sin_addr
     );
 
@@ -447,6 +448,23 @@ bool compile_remote(
         return false;
     }
 
+    // 0: worker failure, 1: cached object, 2/3: compiler failure/success.
+    if (status == 2 || status == 3) {
+        uint32_t exit_code, length;
+        if (!recv_u32(sock, exit_code) || !recv_u32(sock, length)
+            || length > 1024 * 1024) {
+            std::cerr << "Invalid compiler response\n";
+            return false;
+        }
+        std::string diagnostics(length, '\0');
+        if (length && !recv_all(sock, diagnostics.data(), length)) return false;
+        std::osyncstream(std::cerr) << "[" << source.generic_string() << "] compiler exit status: "
+                  << exit_code << '\n' << diagnostics;
+        if (status == 2 || exit_code != 0) return false;
+    } else if (status != 0 && status != 1) {
+        std::cerr << "Unknown worker response\n";
+        return false;
+    }
     if (status == 0) {
         std::cerr
             << "Remote compilation failed: "
@@ -548,9 +566,9 @@ int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr
             << "Usage:\n"
-            << "  ./forge-client file1.cpp file2.cpp\n\n"
+            << "  ./forge-client [--host IPv4] [--port PORT] file1.cpp file2.cpp\n\n"
             << "or:\n"
-            << "  ./forge-client <compiler flags> -- <source files>\n";
+            << "  ./forge-client [--host IPv4] [--port PORT] <compiler flags> -- <source files>\n";
 
         return 1;
     }
@@ -558,9 +576,31 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> flags;
     std::vector<std::string> sources;
 
+    std::string host = "127.0.0.1";
+    int port = 9000;
+    int first = 1;
+    while (first < argc) {
+        std::string option = argv[first];
+        if (option != "--host" && option != "--port") break;
+        if (++first == argc) {
+            std::cerr << "Missing value for " << option << '\n';
+            return 1;
+        }
+        if (option == "--host") host = argv[first];
+        else if (!parse_port(argv[first], port)) {
+            std::cerr << "Port must be an integer from 1 to 65535\n";
+            return 1;
+        }
+        ++first;
+    }
+    in_addr address{};
+    if (inet_pton(AF_INET, host.c_str(), &address) != 1) {
+        std::cerr << "Worker host must be a valid IPv4 address\n";
+        return 1;
+    }
     int separator = -1;
 
-    for (int i = 1; i < argc; ++i) {
+    for (int i = first; i < argc; ++i) {
         if (std::string(argv[i]) == "--") {
             separator = i;
             break;
@@ -570,11 +610,11 @@ int main(int argc, char* argv[]) {
     if (separator == -1) {
         flags.push_back("-std=c++20");
 
-        for (int i = 1; i < argc; ++i) {
+        for (int i = first; i < argc; ++i) {
             sources.push_back(argv[i]);
         }
     } else {
-        for (int i = 1; i < separator; ++i) {
+        for (int i = first; i < separator; ++i) {
             flags.push_back(argv[i]);
         }
 
@@ -613,7 +653,9 @@ int main(int argc, char* argv[]) {
                 std::launch::async,
                 compile_remote,
                 source,
-                flags
+                flags,
+                host,
+                port
             )
         );
     }

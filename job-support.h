@@ -9,6 +9,18 @@
 #include <unistd.h>
 #include <vector>
 
+inline bool parse_port(const std::string& text, int& port) {
+    if (text.empty() || text.size() > 5) return false;
+    int value = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') return false;
+        value = value * 10 + (c - '0');
+    }
+    if (value < 1 || value > 65535) return false;
+    port = value;
+    return true;
+}
+
 // Each job owns its socket, including when an exception interrupts it.
 struct SocketGuard {
     int fd;

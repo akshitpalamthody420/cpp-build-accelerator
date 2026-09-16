@@ -21,17 +21,17 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
         port = probe.getsockname()[1]
     for name in ('forge-worker', 'forge-client'):
         source = (sources / (name + '.cpp')).read_text()
-        source = source.replace('const int PORT = 9000;', f'const int PORT = {port};')
         path = root / (name + '.cpp')
         path.write_text(source)
         subprocess.run(['g++', '-std=c++20', '-Wall', '-Wextra', '-pthread',
                         '-I', str(sources), str(path), '-o', str(root / name)], check=True)
     worker, client = str(root / 'forge-worker'), str(root / 'forge-client')
+    client_command = [client, '--host', '127.0.0.1', '--port', str(port)]
     (root / 'worker-jobs/job-1').mkdir(parents=True)
     (root / 'worker-jobs/job-1/stale.h').write_text('old data')
     (root / 'main.cpp').write_text('int main() { return 0; }\n')
     with (root / 'worker.log').open('w') as log:
-        server = subprocess.Popen([worker], cwd=root, stdout=log, stderr=log)
+        server = subprocess.Popen([worker, '--port', str(port)], cwd=root, stdout=log, stderr=log)
         try:
             for _ in range(50):
                 if server.poll() is not None:
@@ -61,10 +61,25 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
                 connection.close()
 
             (root / 'bad.cpp').write_text('this is invalid C++')
-            failed = subprocess.run([client, 'bad.cpp'], cwd=root, capture_output=True, timeout=30)
+            failed = subprocess.run(client_command + ['bad.cpp'], cwd=root, capture_output=True, timeout=30)
             assert failed.returncode != 0
+            assert b'bad.cpp:1:' in failed.stderr, failed.stderr
+            assert b'compiler exit status: 1' in failed.stderr, failed.stderr
+            mixed = subprocess.run(client_command + ['bad.cpp', 'main.cpp'], cwd=root,
+                                   capture_output=True, timeout=30)
+            assert mixed.returncode != 0 and b'bad.cpp:1:' in mixed.stderr
+            assert (root / 'returned/main.o').is_file()
+            (root / 'warning.cpp').write_text('int f() { int unused; return 0; }')
+            warning = subprocess.run(client_command + ['-Wall', '--', 'warning.cpp'],
+                                     cwd=root, capture_output=True, timeout=30)
+            assert warning.returncode == 0, warning.stderr
+            assert b'warning.cpp:' in warning.stderr and b'warning:' in warning.stderr
+            for options in (['--host', 'invalid'], ['--port', '0'], ['--port', '65536'],
+                            ['--port', '12x'], ['--host'], ['--port']):
+                invalid = subprocess.run([client] + options, cwd=root, capture_output=True, timeout=5)
+                assert invalid.returncode != 0
             for _ in range(2):
-                result = subprocess.run([client, 'main.cpp'], cwd=root, capture_output=True, timeout=30)
+                result = subprocess.run(client_command + ['main.cpp'], cwd=root, capture_output=True, timeout=30)
                 assert result.returncode == 0, result.stderr.decode()
                 assert (root / 'returned/main.o').stat().st_size > 0
             subprocess.run(['g++', 'returned/main.o', '-o', 'app'], cwd=root, check=True)
@@ -72,14 +87,14 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
             # Linux /dev/full opens normally but fails when data is written.
             (root / 'returned/main.o').unlink()
             (root / 'returned/main.o').symlink_to('/dev/full')
-            failed_write = subprocess.run([client, 'main.cpp'], cwd=root,
+            failed_write = subprocess.run(client_command + ['main.cpp'], cwd=root,
                                           capture_output=True, timeout=30)
             assert failed_write.returncode != 0
             assert b'Could not write returned object' in failed_write.stderr
             time.sleep(0.5)
             assert server.poll() is None
             assert list((root / 'worker-jobs').iterdir()) == [root / 'worker-jobs/job-1']
-            print('PASS: disconnects, per-job exceptions, compile failure recovery, repeat build, linking, failed writes, workspace cleanup')
+            print('PASS: diagnostics, warnings, concurrent failure/success, host/port options, invalid arguments, disconnects, exception recovery, cached builds, linking, failed writes, cleanup')
         finally:
             server.terminate()
             server.wait(timeout=5)
