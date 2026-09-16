@@ -1,0 +1,36 @@
+{
+  "measured_at_utc": "2026-09-16T09:55:05.305013+00:00",
+  "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+  "logical_cpus": 24,
+  "compiler": "g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+  "jobs": 4,
+  "repeats": 3,
+  "source_files": 21,
+  "flags": [
+    "-std=c++20",
+    "-O2"
+  ],
+  "method": "Client and worker on the same machine over loopback. 20 tiny pool files plus a generated main. Local baseline compiles serially. Each trial runs local, cold Forge, then warm Forge. Timings include linking, exclude tool builds, worker startup, and executable verification. OS filesystem cache is not cleared.",
+  "seconds": {
+    "local_sequential": [
+      0.4267153659999998,
+      0.43087642299999906,
+      0.4364882339999987
+    ],
+    "forge_cold": [
+      0.3887299110000004,
+      0.3855522690000015,
+      0.38620915899999986
+    ],
+    "forge_warm": [
+      0.18148803499999921,
+      0.18331423499999744,
+      0.18052966699999828
+    ]
+  },
+  "median_seconds": {
+    "local_sequential": 0.43087642299999906,
+    "forge_cold": 0.38620915899999986,
+    "forge_warm": 0.18148803499999921
+  }
+}

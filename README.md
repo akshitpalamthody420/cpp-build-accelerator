@@ -1,141 +1,175 @@
-# Forge — Distributed C++ Build Accelerator
+# Forge — C++ build accelerator
 
-Forge is a C++20 remote build accelerator prototype. The client discovers C/C++ project dependencies using GCC, transfers each compilation job over TCP, and receives compiled object files from a Linux worker.
+Forge sends C++ compilation jobs to a Linux worker over TCP, then links the
+returned object files on the client. The worker keeps an object cache so it can
+skip compilation when the source, project headers, flags, and compiler identity
+match an earlier job.
 
-## Implemented
+This is a small single-worker project. It uses GCC for the actual compilation;
+Forge handles the file transfer, scheduling, cache lookup, and build results.
 
-- TCP client/worker protocol using POSIX sockets
-- Bounded parallel compilation requests from the client (`-j`)
-- Relative-path preservation for nested project trees
-- GCC `-MM` direct/transitive project-header discovery
-- Transfer of source files, headers, and compiler flags
-- Per-job isolated worker directories
-- SHA-256 content-addressed object cache
-- Cache invalidation on source/header contents, compiler flags, source path, and compiler identity
-- Bounded worker thread pool with a 64-job queue
-- Configurable worker IPv4 address and TCP port
-- Compiler output and exit-status forwarding
-- Socket timeouts, per-job failure handling, and temporary workspace cleanup
-- Local executable linking and per-invocation build statistics
+## Build it
 
-## Build
+Use Linux or WSL with a GCC version that supports C++20, including `std::jthread`
+and `std::osyncstream`. You also need Make and coreutils (`sha256sum` and `head`).
+Python 3 is only needed for the tests and benchmark.
 
-Linux / WSL:
+On Ubuntu or Debian:
 
 ```bash
+sudo apt update
+sudo apt install build-essential python3 coreutils
 make
 ```
 
-Or manually:
+Run `make` on both machines when using a separate worker. The client also needs
+GCC: it discovers headers locally and performs the final link. Use compatible
+GCC toolchains, target architectures, and system headers on both machines.
+
+`make` builds `forge-client` and `forge-worker`. Compiler settings can be changed
+with commands such as `make CXX=g++ CXXFLAGS='-O0 -g -Wall'`. The test scripts use
+`g++` directly so their compiler choice is explicit.
+
+## Run a build
+
+Start the worker in one terminal:
 
 ```bash
-g++ -std=c++20 forge-client.cpp -o forge-client -pthread
-g++ -std=c++20 forge-worker.cpp -o forge-worker -pthread
+./forge-worker --port 9000
 ```
 
-The worker also expects `sha256sum` to be available.
-
-## Run
-
-Start the worker:
+In another terminal, run the client from the directory containing your sources:
 
 ```bash
-./forge-worker
+./forge-client -j 4 -o app main.cpp math.cpp strings.cpp
+./app
 ```
 
-Run the client from the project root:
+The defaults are `127.0.0.1:9000`, four concurrent jobs, and an executable named
+`app`. To use another machine:
 
 ```bash
-./forge-client main.cpp math.cpp strings.cpp
+./forge-client --host 192.168.1.50 --port 9000 -j 4 -o app main.cpp math.cpp strings.cpp
 ```
 
-This compiles the selected files and links them locally into `app`. Choose an
-output name with `-o`, or keep the earlier object-only workflow with
-`--compile-only`:
+The host must be an IPv4 address. The worker listens on all interfaces. Use a
+trusted network: the protocol has no authentication or encryption, and the
+compiler is not sandboxed.
+
+Put Forge options first. If you need compiler flags, separate them from the
+source list with `--`:
 
 ```bash
-./forge-client -o my-app main.cpp math.cpp strings.cpp
-./forge-client -j 2 -o my-app main.cpp math.cpp strings.cpp
-./forge-client --compile-only main.cpp math.cpp strings.cpp
-./forge-client -o my-app --link-flag -lm -std=c++20 -O2 -- main.cpp math.cpp strings.cpp
+./forge-client -o flag-app -std=c++20 -O2 -Iflag-test/include -DFACTOR=7 -- flag-test/src/main.cpp
+./forge-client --compile-only -j2 main.cpp math.cpp strings.cpp
+./forge-client -o app --link-flag -lm -std=c++20 -O2 -- main.cpp math.cpp strings.cpp
 ```
 
-Place Forge options before compiler flags or source files. Repeat `--link-flag`
-for multiple linker arguments. Compiler flags are also supplied to local GCC at
-link time, which preserves options such as `-pthread` and `-fsanitize=address`.
-Link-only arguments are added after the object files.
+- `-j N` or `-jN` sets the client job limit, from 1 to 256. `-j1` is serial.
+- `-o NAME` chooses the executable name.
+- `--compile-only` saves objects under `returned/` without linking.
+- `--link-flag ARG` adds one linker argument after the object files. Repeat it
+  for more arguments. Compiler flags are also used during linking, so options
+  such as `-pthread` and `-fsanitize=address` carry through.
 
-Use `-j N` or `-jN` to limit simultaneous client compilation jobs. The default is
-4; accepted values are 1 through 256, capped by the number of selected files.
-The limit covers dependency discovery, connection, transfer, and result handling.
-As soon as one job finishes, its thread takes the next source; a failed job does
-not prevent later sources from being processed. `-j1` processes sources serially.
-The worker's own thread pool still controls how many compilers run on its machine.
-This limit applies per client invocation; an overloaded worker can still reject
-requests from multiple clients, and automatic retries are not implemented yet.
+A failed compilation skips linking. A failed link leaves an existing executable
+in place, so check the command's exit status before running an old executable.
+The client returns 0 on success and 1 on a build failure.
 
-Complete builds use fresh object directories and link only the objects received
-for that invocation. Any compilation failure skips linking. The executable is
-published only after a successful link, so a failed build leaves an existing
-executable unchanged. Temporary build objects are removed afterward;
-`--compile-only` retains objects under `returned/` as before.
+Compiler errors and warnings appear on the client with their source locations
+and compiler exit status. Output is capped at 1 MiB per job. Cached objects do
+not replay earlier warnings. Rebuild and restart the client and worker together
+when updating Forge; the protocol is not version-negotiated.
 
-Every completed build invocation prints a summary such as:
+## How the pieces fit together
 
 ```text
-Build summary: compiled=2, cache hits=1, failures=0, link=succeeded, elapsed=0.431s
+source list -> client job threads -> TCP -> worker queue -> cache lookup
+                                                  | miss: run g++
+returned objects <- TCP <--------------------------+
+       |
+       +-> local g++ link -> executable
 ```
 
-`compiled` counts successfully received newly compiled objects; `cache hits`
-counts successfully received cached objects, explicitly identified by the
-worker's cached-result response. `failures` counts failed compilation jobs,
-including transport or local object-write failures. Link failure is reported
-separately and also makes the client exit unsuccessfully. Elapsed time includes
-dependency discovery, transfer, compilation/cache lookup, and local linking.
+`forge-client.cpp` runs `g++ -MM` to find each source's project headers, including
+indirect includes. It sends those files, their relative paths, and the compiler
+flags to the worker. A fixed number of client threads takes jobs from the source
+list; finishing one job frees that thread for the next one.
 
-With compiler flags:
+`forge-worker.cpp` has a thread pool based on its reported hardware concurrency
+and a queue of up to 64 waiting connections. Each job gets a fresh directory.
+The cache key hashes the compiler identity, flags in order, source path, and
+sorted dependency paths and contents. A hit returns the stored object; a miss
+runs GCC and publishes the object in the cache.
+
+The worker explicitly marks cached results. The client counts successfully
+received fresh objects, cached objects, and failed jobs, and reports link status
+and elapsed time. Full builds use a private object directory, so an object left
+by a previous build cannot accidentally be linked. Temporary job directories are
+removed when their jobs finish. `job-support.h` holds the shared resource helpers.
+
+## Tests
 
 ```bash
-./forge-client -std=c++20 -O2 -Iflag-test/include -DFACTOR=7 -- flag-test/src/main.cpp
+make test
 ```
 
-The default endpoint is `127.0.0.1:9000`. To use another machine or port:
+The scripts compile their own test binaries and use temporary directories and
+spare ports. They do not need your normal worker to be running.
+
+`test-failures.py` checks disconnects, exceptions, failed writes, compiler errors,
+link failures, cache counts, output preservation, and the measured number of
+concurrent requests for `-j1`, `-j3`, and the default limit.
+
+`test-examples.py` builds and runs the small programs in this repository:
+
+- The basic math and greeting program.
+- `dependency-test`: indirect headers and cache invalidation after a header edit.
+- `flag-test`: include directories and a changed macro definition.
+- `path-test` and `complex-test`: nested paths and duplicate source basenames.
+- `pool-test`: twenty source files, linked with a generated main that checks the sum.
+
+Only temporary copies of the examples are edited during testing. Assertions
+check program output and relevant cache counts; any failure stops the test.
+
+## Benchmark
 
 ```bash
-# On the worker machine:
-./forge-worker --port 9100
-
-# On the client machine (replace the example IP with your worker's IPv4 address):
-./forge-client --host 192.168.1.50 --port 9100 main.cpp math.cpp strings.cpp
-./forge-client --host 192.168.1.50 --port 9100 -std=c++20 -Wall -- main.cpp
+make benchmark
+make benchmark REPEATS=5 JOBS=2
 ```
 
-Place connection options before compiler flags or source files. Ports must be
-between 1 and 65535. Hostnames and IPv6 are not supported yet. The worker listens
-on all interfaces; use it on a trusted network with a compatible GCC toolchain.
+This compares ordinary sequential GCC compilation, a parallel Forge build with
+an empty object cache, and the same Forge build repeated with a populated cache.
+It uses the twenty tiny `pool-test` files plus a generated main, with C++20 and
+`-O2`. Each executable is run to check its output.
 
-Compiler errors and warnings appear on the client's stderr, grouped by source
-file with the compiler exit status. The client exits with 1 if any job fails and
-0 if all succeed. A compiler killed by a signal is reported as 128 plus its signal
-number. Output is limited to 1 MiB per job, with a truncation notice. Cached jobs
-return the object without replaying earlier warnings. Dependency-discovery errors
-are still reported directly by the client's local GCC.
+The script records every sample, medians, compiler, OS, CPU count, and job limit
+in `benchmark-results.json`. It times the complete compile-and-link command,
+excluding tool compilation, worker startup, and executable verification. Each
+trial gets a fresh worker directory; the OS filesystem cache is not cleared.
+Client and worker run on the same machine over loopback. The local baseline runs
+first, then the cold Forge build, then the warm build.
 
-Rebuild and restart both programs together: the compilation response format now
-includes exit status and diagnostics. Older clients cannot read the new responses.
+See [BENCHMARK.md](BENCHMARK.md) for the checked-in measurements. These examples
+are small enough that process startup and transfer overhead matter a lot. They
+are useful for checking behavior, but do not establish a speedup for large
+projects or a real network of machines.
 
-Run the Linux regression tests with `python3 test-failures.py`. They compile both
-programs and run on a spare port without modifying the source or existing worker.
+## Current limits
 
-## Cache test
-
-Run the same build twice. The first build should log `CACHE MISS`; the second should log `CACHE HIT`.
-
-Change a header or a compiler flag and the affected job should become a cache miss.
-
-## Features that I am going to implement next
-
-- Multiple remote workers and round-robin/load-aware scheduling
-- Retry/failover on worker failure
-- Further protocol hardening
-- Benchmarks across 1/2/3 workers and warm-cache builds
+- One worker per client; no discovery, load balancing, or automatic retry.
+- GCC and Linux/POSIX only. No native Windows/MSVC support or cross-compilation setup.
+- Sources and project headers must use relative paths inside the project. GCC
+  dependency output with spaces or escaped characters in filenames is not parsed
+  correctly yet. Select source files explicitly; Forge does not scan directories.
+- System headers are not transferred or hashed. Changes to those headers or
+  environmental inputs can make the object cache stale. Time-dependent macros
+  are another cache limitation.
+- Only simple compilation flags are supported. Options that change GCC's output
+  mode, response files, modules, and generated-file build graphs are not handled.
+- The client limit applies to one invocation. Several clients can still fill the
+  worker queue. Socket operations have a 120-second timeout, but a hung compiler
+  process has no execution deadline yet.
+- The cache has no size limit or eviction policy. Stop the worker before using
+  `make clean`, which removes binaries, cached objects, and job/output directories.

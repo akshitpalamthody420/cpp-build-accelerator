@@ -18,3 +18,15 @@ build/
 cmake-build-*/
 forge-test/forge-client
 .DS_Store
+
+# Local Forge output
+/forge-client
+/forge-worker
+/app
+/dependency-app
+/flag-app
+/complex-app
+/returned/
+/received/
+/worker-jobs/
+/cache/
