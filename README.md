@@ -16,6 +16,7 @@ Forge is a C++20 remote build accelerator prototype. The client discovers C/C++ 
 - Configurable worker IPv4 address and TCP port
 - Compiler output and exit-status forwarding
 - Socket timeouts, per-job failure handling, and temporary workspace cleanup
+- Local executable linking and per-invocation build statistics
 
 ## Build
 
@@ -47,6 +48,40 @@ Run the client from the project root:
 ```bash
 ./forge-client main.cpp math.cpp strings.cpp
 ```
+
+This compiles the selected files and links them locally into `app`. Choose an
+output name with `-o`, or keep the earlier object-only workflow with
+`--compile-only`:
+
+```bash
+./forge-client -o my-app main.cpp math.cpp strings.cpp
+./forge-client --compile-only main.cpp math.cpp strings.cpp
+./forge-client -o my-app --link-flag -lm -std=c++20 -O2 -- main.cpp math.cpp strings.cpp
+```
+
+Place Forge options before compiler flags or source files. Repeat `--link-flag`
+for multiple linker arguments. Compiler flags are also supplied to local GCC at
+link time, which preserves options such as `-pthread` and `-fsanitize=address`.
+Link-only arguments are added after the object files.
+
+Complete builds use fresh object directories and link only the objects received
+for that invocation. Any compilation failure skips linking. The executable is
+published only after a successful link, so a failed build leaves an existing
+executable unchanged. Temporary build objects are removed afterward;
+`--compile-only` retains objects under `returned/` as before.
+
+Every completed build invocation prints a summary such as:
+
+```text
+Build summary: compiled=2, cache hits=1, failures=0, link=succeeded, elapsed=0.431s
+```
+
+`compiled` counts successfully received newly compiled objects; `cache hits`
+counts successfully received cached objects, explicitly identified by the
+worker's cached-result response. `failures` counts failed compilation jobs,
+including transport or local object-write failures. Link failure is reported
+separately and also makes the client exit unsuccessfully. Elapsed time includes
+dependency discovery, transfer, compilation/cache lookup, and local linking.
 
 With compiler flags:
 

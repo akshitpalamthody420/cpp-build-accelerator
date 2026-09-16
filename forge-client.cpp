@@ -1,3 +1,6 @@
+#include <chrono>
+#include <iomanip>
+#include <sys/wait.h>
 #include "job-support.h"
 #include <syncstream>
 #include <arpa/inet.h>
@@ -270,11 +273,20 @@ bool discover_dependencies(
     return !dependencies.empty();
 }
 
-bool compile_remote(
+struct CompileResult {
+    bool success;
+    bool cached;
+    fs::path object;
+    CompileResult(bool ok = false, bool hit = false, fs::path path = {})
+        : success(ok), cached(hit), object(std::move(path)) {}
+};
+
+CompileResult compile_remote(
     const std::string& source_argument,
     const std::vector<std::string>& flags,
     const std::string& host,
-    int port
+    int port,
+    const fs::path& object_directory
 ) {
 
     fs::path source =
@@ -488,7 +500,9 @@ bool compile_remote(
     fs::path relative_object =
         fs::path(object_path_string).lexically_normal();
 
-    if (!safe_relative_path(relative_object)) {
+    fs::path expected_object = source;
+    expected_object.replace_extension(".o");
+    if (!safe_relative_path(relative_object) || relative_object != expected_object) {
         std::cerr << "Worker returned unsafe path\n";
 
         return false;
@@ -520,7 +534,7 @@ bool compile_remote(
     }
 
     fs::path output_path =
-        fs::path("returned") / relative_object;
+        object_directory / relative_object;
 
     fs::create_directories(
         output_path.parent_path()
@@ -559,16 +573,16 @@ bool compile_remote(
         << '\n';
 
 
-    return true;
+    return {true, status == 1, output_path};
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr
             << "Usage:\n"
-            << "  ./forge-client [--host IPv4] [--port PORT] file1.cpp file2.cpp\n\n"
+            << "  ./forge-client [--host IPv4] [--port PORT] [-o executable] [--compile-only] file1.cpp file2.cpp\n\n"
             << "or:\n"
-            << "  ./forge-client [--host IPv4] [--port PORT] <compiler flags> -- <source files>\n";
+            << "  ./forge-client [--host IPv4] [--port PORT] [-o executable] [--compile-only] <compiler flags> -- <source files>\n";
 
         return 1;
     }
@@ -578,15 +592,22 @@ int main(int argc, char* argv[]) {
 
     std::string host = "127.0.0.1";
     int port = 9000;
+    fs::path executable = "app";
+    bool compile_only = false;
+    std::vector<std::string> link_flags;
     int first = 1;
     while (first < argc) {
         std::string option = argv[first];
-        if (option != "--host" && option != "--port") break;
+        if (option == "--compile-only") { compile_only = true; ++first; continue; }
+        if (option != "--host" && option != "--port" && option != "-o"
+            && option != "--link-flag") break;
         if (++first == argc) {
             std::cerr << "Missing value for " << option << '\n';
             return 1;
         }
         if (option == "--host") host = argv[first];
+        else if (option == "-o") executable = argv[first];
+        else if (option == "--link-flag") link_flags.push_back(argv[first]);
         else if (!parse_port(argv[first], port)) {
             std::cerr << "Port must be an integer from 1 to 65535\n";
             return 1;
@@ -645,7 +666,25 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::vector<std::future<bool>> jobs;
+    // Reject duplicate object destinations before launching concurrent writes.
+    std::set<fs::path> destinations;
+    for (const auto& source : sources) {
+        fs::path object = fs::path(source).lexically_normal();
+        if (!compile_only && fs::absolute(executable).lexically_normal()
+            == fs::absolute(object).lexically_normal()) {
+            std::cerr << "Executable must not overwrite an input source\n";
+            return 1;
+        }
+        object.replace_extension(".o");
+        if (!destinations.insert(object).second) {
+            std::cerr << "Duplicate object destination: " << object << '\n';
+            return 1;
+        }
+    }
+    const auto started = std::chrono::steady_clock::now();
+    JobWorkspace invocation("returned");
+    fs::path object_directory = compile_only ? fs::path("returned") : invocation.path;
+    std::vector<std::future<CompileResult>> jobs;
 
     for (const auto& source : sources) {
         jobs.push_back(
@@ -655,32 +694,59 @@ int main(int argc, char* argv[]) {
                 source,
                 flags,
                 host,
-                port
+                port,
+                object_directory
             )
         );
     }
 
-    bool success = true;
-
+    size_t compiled = 0, cached = 0, failures = 0;
+    std::vector<fs::path> objects;
     for (auto& job : jobs) {
         try {
-            if (!job.get()) success = false;
+            CompileResult result = job.get();
+            if (!result.success) { ++failures; continue; }
+            if (result.cached) ++cached;
+            else ++compiled;
+            objects.push_back(result.object);
         } catch (const std::exception& error) {
             std::cerr << "Job failed: " << error.what() << '\n';
-            success = false;
+            ++failures;
         } catch (...) {
             std::cerr << "Job failed with an unknown error\n";
-            success = false;
+            ++failures;
         }
     }
 
-    if (!success) {
-        std::cerr << "\nRemote build failed.\n";
-        return 1;
+    bool link_failed = false;
+    std::string link_status = compile_only ? "not requested" : "skipped";
+    if (!compile_only && failures == 0) {
+        try {
+            fs::path parent = fs::absolute(executable).parent_path();
+            JobWorkspace link_workspace(parent);
+            fs::path temporary = link_workspace.path / "executable";
+            std::string command = "g++ ";
+            for (const auto& flag : flags) command += shell_quote(flag) + " ";
+            for (const auto& object : objects) command += shell_quote(object.string()) + " ";
+            for (const auto& flag : link_flags) command += shell_quote(flag) + " ";
+            command += "-o " + shell_quote(temporary.string());
+            int status = std::system(command.c_str());
+            if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                throw std::runtime_error("Local linking failed; see linker output above");
+            }
+            fs::rename(temporary, executable);
+            link_status = "succeeded";
+            std::cout << "Created executable: " << executable.string() << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            link_failed = true;
+            link_status = "failed";
+        }
     }
-
-    std::cout
-        << "\nAll remote compilations successful.\n";
-
-    return 0;
+    double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    std::cout << "\nBuild summary: compiled=" << compiled << ", cache hits=" << cached
+              << ", failures=" << failures << ", link=" << link_status
+              << ", elapsed=" << std::fixed << std::setprecision(3) << elapsed << "s\n";
+    return failures || link_failed ? 1 : 0;
 }

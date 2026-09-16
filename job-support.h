@@ -39,8 +39,9 @@ inline bool set_socket_timeouts(int fd) {
 
 struct JobWorkspace {
     std::filesystem::path path;
-    JobWorkspace() {
-        std::string pattern = "worker-jobs/job-XXXXXX";
+    explicit JobWorkspace(const std::filesystem::path& base = "worker-jobs") {
+        std::filesystem::create_directories(base);
+        std::string pattern = (base / "job-XXXXXX").string();
         std::vector<char> name(pattern.begin(), pattern.end());
         name.push_back('\0');
         char* directory = mkdtemp(name.data());

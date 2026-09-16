@@ -26,7 +26,8 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
         subprocess.run(['g++', '-std=c++20', '-Wall', '-Wextra', '-pthread',
                         '-I', str(sources), str(path), '-o', str(root / name)], check=True)
     worker, client = str(root / 'forge-worker'), str(root / 'forge-client')
-    client_command = [client, '--host', '127.0.0.1', '--port', str(port)]
+    build_command = [client, '--host', '127.0.0.1', '--port', str(port)]
+    client_command = build_command + ['--compile-only']
     (root / 'worker-jobs/job-1').mkdir(parents=True)
     (root / 'worker-jobs/job-1/stale.h').write_text('old data')
     (root / 'main.cpp').write_text('int main() { return 0; }\n')
@@ -91,10 +92,31 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
                                           capture_output=True, timeout=30)
             assert failed_write.returncode != 0
             assert b'Could not write returned object' in failed_write.stderr
+            (root / 'build.cpp').write_text('int helper(); int main() { return helper() == 7 ? 0 : 1; }')
+            (root / 'helper.cpp').write_text('int helper() { return 7; }')
+            build_args = build_command + ['-o', 'build app', 'build.cpp', 'helper.cpp']
+            for expected in (b'compiled=2, cache hits=0', b'compiled=0, cache hits=2'):
+                build = subprocess.run(build_args, cwd=root, capture_output=True, timeout=30)
+                assert build.returncode == 0, build.stderr
+                assert expected in build.stdout and b'link=succeeded' in build.stdout, build.stdout
+                subprocess.run([str(root / 'build app')], check=True)
+            previous = (root / 'build app').read_bytes()
+            (root / 'helper.cpp').write_text('int helper() { invalid syntax; }')
+            build = subprocess.run(build_args, cwd=root, capture_output=True, timeout=30)
+            assert build.returncode != 0 and b'failures=1, link=skipped' in build.stdout
+            assert (root / 'build app').read_bytes() == previous
+            # Existing objects in returned/ must not supply the missing helper.
+            build = subprocess.run(build_command + ['-o', 'build app', 'build.cpp'],
+                                   cwd=root, capture_output=True, timeout=30)
+            assert build.returncode != 0 and b'link=failed' in build.stdout
+            assert (root / 'build app').read_bytes() == previous
+            duplicate = subprocess.run(build_command + ['main.cpp', './main.cpp'],
+                                       cwd=root, capture_output=True, timeout=5)
+            assert duplicate.returncode != 0 and b'Duplicate object' in duplicate.stderr
             time.sleep(0.5)
             assert server.poll() is None
             assert list((root / 'worker-jobs').iterdir()) == [root / 'worker-jobs/job-1']
-            print('PASS: diagnostics, warnings, concurrent failure/success, host/port options, invalid arguments, disconnects, exception recovery, cached builds, linking, failed writes, cleanup')
+            print('PASS: complete builds, cold/warm statistics, skipped/failed links, stale-object exclusion, output preservation, diagnostics, options, failure recovery, cleanup')
         finally:
             server.terminate()
             server.wait(timeout=5)
