@@ -5,7 +5,7 @@ Forge is a C++20 remote build accelerator prototype. The client discovers C/C++ 
 ## Implemented
 
 - TCP client/worker protocol using POSIX sockets
-- Parallel compilation requests from the client
+- Bounded parallel compilation requests from the client (`-j`)
 - Relative-path preservation for nested project trees
 - GCC `-MM` direct/transitive project-header discovery
 - Transfer of source files, headers, and compiler flags
@@ -55,6 +55,7 @@ output name with `-o`, or keep the earlier object-only workflow with
 
 ```bash
 ./forge-client -o my-app main.cpp math.cpp strings.cpp
+./forge-client -j 2 -o my-app main.cpp math.cpp strings.cpp
 ./forge-client --compile-only main.cpp math.cpp strings.cpp
 ./forge-client -o my-app --link-flag -lm -std=c++20 -O2 -- main.cpp math.cpp strings.cpp
 ```
@@ -63,6 +64,15 @@ Place Forge options before compiler flags or source files. Repeat `--link-flag`
 for multiple linker arguments. Compiler flags are also supplied to local GCC at
 link time, which preserves options such as `-pthread` and `-fsanitize=address`.
 Link-only arguments are added after the object files.
+
+Use `-j N` or `-jN` to limit simultaneous client compilation jobs. The default is
+4; accepted values are 1 through 256, capped by the number of selected files.
+The limit covers dependency discovery, connection, transfer, and result handling.
+As soon as one job finishes, its thread takes the next source; a failed job does
+not prevent later sources from being processed. `-j1` processes sources serially.
+The worker's own thread pool still controls how many compilers run on its machine.
+This limit applies per client invocation; an overloaded worker can still reject
+requests from multiple clients, and automatic retries are not implemented yet.
 
 Complete builds use fresh object directories and link only the objects received
 for that invocation. Any compilation failure skips linking. The executable is

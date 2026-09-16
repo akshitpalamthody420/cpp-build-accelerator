@@ -1,11 +1,13 @@
 """Linux regression test: python3 test-failures.py (requires g++)."""
 import pathlib
 import socket
+import socketserver
 import struct
 import subprocess
 import sys
 import tempfile
 import time
+import threading
 
 sources = pathlib.Path(__file__).resolve().parent
 
@@ -28,6 +30,61 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
     worker, client = str(root / 'forge-worker'), str(root / 'forge-client')
     build_command = [client, '--host', '127.0.0.1', '--port', str(port)]
     client_command = build_command + ['--compile-only']
+    # A deliberately slow worker records actual overlapping requests.
+    class MeasuredWorker(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        active = peak = completed = 0
+        lock = threading.Lock()
+
+    class RejectJob(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.settimeout(5)
+            def receive(size):
+                data = b''
+                while len(data) < size:
+                    chunk = self.request.recv(size - len(data))
+                    if not chunk:
+                        raise RuntimeError('Unexpected disconnect')
+                    data += chunk
+                return data
+            def number():
+                return struct.unpack('!I', receive(4))[0]
+            def blob():
+                return receive(number())
+            with self.server.lock:
+                self.server.active += 1
+                self.server.peak = max(self.server.peak, self.server.active)
+            try:
+                blob()  # source
+                for _ in range(number()):
+                    blob()  # flag
+                for _ in range(number()):
+                    blob()  # path
+                    blob()  # contents
+                time.sleep(0.3)
+                self.request.sendall(struct.pack('!I', 0))
+            finally:
+                with self.server.lock:
+                    self.server.active -= 1
+                    self.server.completed += 1
+
+    pool_sources = [f'parallel_{i}.cpp' for i in range(9)]
+    for name in pool_sources:
+        (root / name).write_text('int f() { return 0; }')
+    for options, limit in ((['-j', '1'], 1), (['-j3'], 3), ([], 4)):
+        with MeasuredWorker(('127.0.0.1', 0), RejectJob) as measured:
+            thread = threading.Thread(target=measured.serve_forever)
+            thread.start()
+            try:
+                result = subprocess.run([client, '--port', str(measured.server_address[1]),
+                                         '--compile-only'] + options + pool_sources,
+                                        cwd=root, capture_output=True, timeout=30)
+                assert result.returncode != 0
+                assert b'failures=9' in result.stdout, result.stdout
+                assert measured.completed == 9 and measured.peak == limit, (measured.completed, measured.peak)
+            finally:
+                measured.shutdown()
+                thread.join()
     (root / 'worker-jobs/job-1').mkdir(parents=True)
     (root / 'worker-jobs/job-1/stale.h').write_text('old data')
     (root / 'main.cpp').write_text('int main() { return 0; }\n')
@@ -76,7 +133,8 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
             assert warning.returncode == 0, warning.stderr
             assert b'warning.cpp:' in warning.stderr and b'warning:' in warning.stderr
             for options in (['--host', 'invalid'], ['--port', '0'], ['--port', '65536'],
-                            ['--port', '12x'], ['--host'], ['--port']):
+                            ['--port', '12x'], ['--host'], ['--port'], ['-j'],
+                            ['-j0'], ['-j-1'], ['-j257'], ['-j', 'abc']):
                 invalid = subprocess.run([client] + options, cwd=root, capture_output=True, timeout=5)
                 assert invalid.returncode != 0
             for _ in range(2):
@@ -94,7 +152,7 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
             assert b'Could not write returned object' in failed_write.stderr
             (root / 'build.cpp').write_text('int helper(); int main() { return helper() == 7 ? 0 : 1; }')
             (root / 'helper.cpp').write_text('int helper() { return 7; }')
-            build_args = build_command + ['-o', 'build app', 'build.cpp', 'helper.cpp']
+            build_args = build_command + ['-j', '1', '-o', 'build app', 'build.cpp', 'helper.cpp']
             for expected in (b'compiled=2, cache hits=0', b'compiled=0, cache hits=2'):
                 build = subprocess.run(build_args, cwd=root, capture_output=True, timeout=30)
                 assert build.returncode == 0, build.stderr
@@ -116,7 +174,7 @@ with tempfile.TemporaryDirectory(prefix='forge-test-') as root:
             time.sleep(0.5)
             assert server.poll() is None
             assert list((root / 'worker-jobs').iterdir()) == [root / 'worker-jobs/job-1']
-            print('PASS: complete builds, cold/warm statistics, skipped/failed links, stale-object exclusion, output preservation, diagnostics, options, failure recovery, cleanup')
+            print('PASS: measured -j1/-j3/default concurrency, queue progress after failures, complete builds, statistics, diagnostics, options, failure recovery, cleanup')
         finally:
             server.terminate()
             server.wait(timeout=5)

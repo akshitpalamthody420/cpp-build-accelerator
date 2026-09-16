@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <iomanip>
 #include <sys/wait.h>
@@ -10,7 +11,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <future>
+#include <atomic>
+#include <thread>
 #include <iostream>
 #include <iterator>
 #include <netinet/in.h>
@@ -580,9 +582,9 @@ int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr
             << "Usage:\n"
-            << "  ./forge-client [--host IPv4] [--port PORT] [-o executable] [--compile-only] file1.cpp file2.cpp\n\n"
+            << "  ./forge-client [--host IPv4] [--port PORT] [-o executable] [--compile-only] [-j jobs] file1.cpp file2.cpp\n\n"
             << "or:\n"
-            << "  ./forge-client [--host IPv4] [--port PORT] [-o executable] [--compile-only] <compiler flags> -- <source files>\n";
+            << "  ./forge-client [--host IPv4] [--port PORT] [-o executable] [--compile-only] [-j jobs] <compiler flags> -- <source files>\n";
 
         return 1;
     }
@@ -595,17 +597,32 @@ int main(int argc, char* argv[]) {
     fs::path executable = "app";
     bool compile_only = false;
     std::vector<std::string> link_flags;
+    int parallel_jobs = 4;
     int first = 1;
     while (first < argc) {
         std::string option = argv[first];
+        if (option.size() > 2 && option.substr(0, 2) == "-j") {
+            if (!parse_port(option.substr(2), parallel_jobs) || parallel_jobs > 256) {
+                std::cerr << "Job limit must be an integer from 1 to 256\n";
+                return 1;
+            }
+            ++first;
+            continue;
+        }
         if (option == "--compile-only") { compile_only = true; ++first; continue; }
         if (option != "--host" && option != "--port" && option != "-o"
-            && option != "--link-flag") break;
+            && option != "--link-flag" && option != "-j") break;
         if (++first == argc) {
             std::cerr << "Missing value for " << option << '\n';
             return 1;
         }
-        if (option == "--host") host = argv[first];
+        if (option == "-j") {
+            if (!parse_port(argv[first], parallel_jobs) || parallel_jobs > 256) {
+                std::cerr << "Job limit must be an integer from 1 to 256\n";
+                return 1;
+            }
+        }
+        else if (option == "--host") host = argv[first];
         else if (option == "-o") executable = argv[first];
         else if (option == "--link-flag") link_flags.push_back(argv[first]);
         else if (!parse_port(argv[first], port)) {
@@ -684,40 +701,44 @@ int main(int argc, char* argv[]) {
     const auto started = std::chrono::steady_clock::now();
     JobWorkspace invocation("returned");
     fs::path object_directory = compile_only ? fs::path("returned") : invocation.path;
-    std::vector<std::future<CompileResult>> jobs;
-
-    for (const auto& source : sources) {
-        jobs.push_back(
-            std::async(
-                std::launch::async,
-                compile_remote,
-                source,
-                flags,
-                host,
-                port,
-                object_directory
-            )
-        );
+    const size_t worker_count = std::min(static_cast<size_t>(parallel_jobs), sources.size());
+    std::cout << "Parallel job limit: " << worker_count << '\n';
+    std::vector<CompileResult> results(sources.size());
+    std::atomic<size_t> next_source{0};
+    auto run_jobs = [&]() {
+        while (true) {
+            size_t index = next_source.fetch_add(1);
+            if (index >= sources.size()) return;
+            try {
+                results[index] = compile_remote(sources[index], flags, host, port, object_directory);
+            } catch (const std::exception& error) {
+                std::osyncstream(std::cerr) << "Job failed: " << sources[index]
+                                          << ": " << error.what() << '\n';
+            } catch (...) {
+                std::osyncstream(std::cerr) << "Job failed: " << sources[index]
+                                          << ": unknown error\n";
+            }
+        }
+    };
+    std::vector<std::jthread> workers;
+    workers.reserve(worker_count);
+    try {
+        for (size_t i = 0; i < worker_count; ++i) workers.emplace_back(run_jobs);
+    } catch (const std::system_error& error) {
+        // Use the calling thread for the missing slot if thread creation fails.
+        std::cerr << "Could not start all job threads: " << error.what() << '\n';
+        run_jobs();
     }
+    for (auto& worker : workers) worker.join();
 
     size_t compiled = 0, cached = 0, failures = 0;
     std::vector<fs::path> objects;
-    for (auto& job : jobs) {
-        try {
-            CompileResult result = job.get();
-            if (!result.success) { ++failures; continue; }
-            if (result.cached) ++cached;
-            else ++compiled;
-            objects.push_back(result.object);
-        } catch (const std::exception& error) {
-            std::cerr << "Job failed: " << error.what() << '\n';
-            ++failures;
-        } catch (...) {
-            std::cerr << "Job failed with an unknown error\n";
-            ++failures;
-        }
+    for (const auto& result : results) {
+        if (!result.success) { ++failures; continue; }
+        if (result.cached) ++cached;
+        else ++compiled;
+        objects.push_back(result.object);
     }
-
     bool link_failed = false;
     std::string link_status = compile_only ? "not requested" : "skipped";
     if (!compile_only && failures == 0) {
