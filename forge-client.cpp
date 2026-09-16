@@ -1,3 +1,4 @@
+#include "job-support.h"
 #include <arpa/inet.h>
 
 #include <array>
@@ -22,8 +23,9 @@ bool send_all(int socket, const void* buffer, size_t bytes) {
     const char* ptr = static_cast<const char*>(buffer);
 
     while (bytes > 0) {
-        ssize_t sent = send(socket, ptr, bytes, 0);
+        ssize_t sent = send(socket, ptr, bytes, MSG_NOSIGNAL);
 
+        if (sent < 0 && errno == EINTR) continue;
         if (sent <= 0) {
             return false;
         }
@@ -41,6 +43,7 @@ bool recv_all(int socket, void* buffer, size_t bytes) {
     while (bytes > 0) {
         ssize_t received = recv(socket, ptr, bytes, 0);
 
+        if (received < 0 && errno == EINTR) continue;
         if (received <= 0) {
             return false;
         }
@@ -327,6 +330,9 @@ bool compile_remote(
         return false;
     }
 
+    SocketGuard connection(sock);
+    if (!set_socket_timeouts(sock)) return false;
+
     sockaddr_in worker{};
     worker.sin_family = AF_INET;
     worker.sin_port = htons(PORT);
@@ -349,7 +355,7 @@ bool compile_remote(
             << source.string()
             << '\n';
 
-        close(sock);
+
         return false;
     }
 
@@ -357,7 +363,7 @@ bool compile_remote(
             sock,
             source.generic_string()
         )) {
-        close(sock);
+
         return false;
     }
 
@@ -365,13 +371,13 @@ bool compile_remote(
             sock,
             static_cast<uint32_t>(flags.size())
         )) {
-        close(sock);
+
         return false;
     }
 
     for (const auto& flag : flags) {
         if (!send_string(sock, flag)) {
-            close(sock);
+
             return false;
         }
     }
@@ -380,7 +386,7 @@ bool compile_remote(
             sock,
             static_cast<uint32_t>(dependencies.size())
         )) {
-        close(sock);
+
         return false;
     }
 
@@ -396,14 +402,14 @@ bool compile_remote(
                 << dependency.string()
                 << '\n';
 
-            close(sock);
+
             return false;
         }
 
         std::string path = dependency.generic_string();
 
         if (!send_string(sock, path)) {
-            close(sock);
+
             return false;
         }
 
@@ -411,7 +417,7 @@ bool compile_remote(
                 sock,
                 static_cast<uint32_t>(file_data.size())
             )) {
-            close(sock);
+
             return false;
         }
 
@@ -423,7 +429,7 @@ bool compile_remote(
                 file_data.size()
             )
         ) {
-            close(sock);
+
             return false;
         }
     }
@@ -437,7 +443,7 @@ bool compile_remote(
 
     if (!recv_u32(sock, status)) {
         std::cerr << "Failed receiving compile status\n";
-        close(sock);
+
         return false;
     }
 
@@ -447,7 +453,7 @@ bool compile_remote(
             << source.string()
             << '\n';
 
-        close(sock);
+
         return false;
     }
 
@@ -457,7 +463,7 @@ bool compile_remote(
             sock,
             object_path_string
         )) {
-        close(sock);
+
         return false;
     }
 
@@ -466,17 +472,21 @@ bool compile_remote(
 
     if (!safe_relative_path(relative_object)) {
         std::cerr << "Worker returned unsafe path\n";
-        close(sock);
+
         return false;
     }
 
     uint32_t object_size;
 
     if (!recv_u32(sock, object_size)) {
-        close(sock);
+
         return false;
     }
 
+    if (object_size > 100 * 1024 * 1024) {
+        std::cerr << "Returned object exceeds 100 MiB limit\n";
+        return false;
+    }
     std::vector<char> object_data(object_size);
 
     if (
@@ -487,7 +497,7 @@ bool compile_remote(
             object_size
         )
     ) {
-        close(sock);
+
         return false;
     }
 
@@ -509,7 +519,7 @@ bool compile_remote(
             << output_path.string()
             << '\n';
 
-        close(sock);
+
         return false;
     }
 
@@ -518,12 +528,19 @@ bool compile_remote(
         object_data.size()
     );
 
+    output.close();
+    if (!output) {
+        std::error_code error;
+        fs::remove(output_path, error);
+        throw std::runtime_error("Could not write returned object");
+    }
+
     std::cout
         << "Received "
         << output_path.generic_string()
         << '\n';
 
-    close(sock);
+
     return true;
 }
 
@@ -604,7 +621,13 @@ int main(int argc, char* argv[]) {
     bool success = true;
 
     for (auto& job : jobs) {
-        if (!job.get()) {
+        try {
+            if (!job.get()) success = false;
+        } catch (const std::exception& error) {
+            std::cerr << "Job failed: " << error.what() << '\n';
+            success = false;
+        } catch (...) {
+            std::cerr << "Job failed with an unknown error\n";
             success = false;
         }
     }

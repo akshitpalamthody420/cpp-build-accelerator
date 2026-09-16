@@ -1,3 +1,4 @@
+#include "job-support.h"
 #include <arpa/inet.h>
 
 #include <algorithm>
@@ -31,6 +32,7 @@ bool recv_all(int socket, void* buffer, size_t bytes) {
     while (bytes > 0) {
         ssize_t received = recv(socket, ptr, bytes, 0);
 
+        if (received < 0 && errno == EINTR) continue;
         if (received <= 0) {
             return false;
         }
@@ -46,8 +48,9 @@ bool send_all(int socket, const void* buffer, size_t bytes) {
     const char* ptr = static_cast<const char*>(buffer);
 
     while (bytes > 0) {
-        ssize_t sent = send(socket, ptr, bytes, 0);
+        ssize_t sent = send(socket, ptr, bytes, MSG_NOSIGNAL);
 
+        if (sent < 0 && errno == EINTR) continue;
         if (sent <= 0) {
             return false;
         }
@@ -346,7 +349,8 @@ bool create_cache_manifest(
         }
     }
 
-    return true;
+    manifest.close();
+    return static_cast<bool>(manifest);
 }
 
 bool compute_sha256(
@@ -373,18 +377,13 @@ bool compute_sha256(
 }
 
 void handle_client(int client_fd) {
+    SocketGuard connection(client_fd);
+    if (!set_socket_timeouts(client_fd)) return;
     uint64_t job_id =
         next_job_id.fetch_add(1);
 
-    fs::path workspace =
-        fs::path("worker-jobs")
-        /
-        (
-            "job-"
-            + std::to_string(job_id)
-        );
-
-    fs::create_directories(workspace);
+    JobWorkspace job_workspace;
+    const fs::path& workspace = job_workspace.path;
 
     std::cout
         << "\nJob "
@@ -397,7 +396,7 @@ void handle_client(int client_fd) {
             client_fd,
             source_string
         )) {
-        close(client_fd);
+
         return;
     }
 
@@ -406,7 +405,7 @@ void handle_client(int client_fd) {
 
     if (!safe_relative_path(relative_source)) {
         std::cerr << "Unsafe source path\n";
-        close(client_fd);
+
         return;
     }
 
@@ -416,13 +415,13 @@ void handle_client(int client_fd) {
             client_fd,
             flag_count
         )) {
-        close(client_fd);
+
         return;
     }
 
     if (flag_count > 128) {
         std::cerr << "Too many compiler flags\n";
-        close(client_fd);
+
         return;
     }
 
@@ -439,7 +438,7 @@ void handle_client(int client_fd) {
                 client_fd,
                 flag
             )) {
-            close(client_fd);
+
             return;
         }
 
@@ -452,7 +451,7 @@ void handle_client(int client_fd) {
             client_fd,
             file_count
         )) {
-        close(client_fd);
+
         return;
     }
 
@@ -461,7 +460,7 @@ void handle_client(int client_fd) {
         file_count > 10000
     ) {
         std::cerr << "Invalid file count\n";
-        close(client_fd);
+
         return;
     }
 
@@ -495,7 +494,7 @@ void handle_client(int client_fd) {
                 client_fd,
                 path_string
             )) {
-            close(client_fd);
+
             return;
         }
 
@@ -504,7 +503,7 @@ void handle_client(int client_fd) {
 
         if (!safe_relative_path(relative_path)) {
             std::cerr << "Unsafe dependency path\n";
-            close(client_fd);
+
             return;
         }
 
@@ -514,7 +513,7 @@ void handle_client(int client_fd) {
                 client_fd,
                 file_size
             )) {
-            close(client_fd);
+
             return;
         }
 
@@ -523,7 +522,7 @@ void handle_client(int client_fd) {
             100 * 1024 * 1024
         ) {
             std::cerr << "Input file too large\n";
-            close(client_fd);
+
             return;
         }
 
@@ -537,7 +536,7 @@ void handle_client(int client_fd) {
                 file_size
             )
         ) {
-            close(client_fd);
+
             return;
         }
 
@@ -559,7 +558,7 @@ void handle_client(int client_fd) {
                 << destination.string()
                 << '\n';
 
-            close(client_fd);
+
             return;
         }
 
@@ -569,6 +568,7 @@ void handle_client(int client_fd) {
         );
 
         output.close();
+        if (!output) throw std::runtime_error("Could not write uploaded file");
 
         dependencies.push_back(
             relative_path
@@ -586,7 +586,7 @@ void handle_client(int client_fd) {
     if (!fs::exists(source_path)) {
         std::cerr << "Primary source missing\n";
         send_u32(client_fd, 0);
-        close(client_fd);
+
         return;
     }
 
@@ -611,7 +611,7 @@ void handle_client(int client_fd) {
         )) {
         std::cerr << "Could not identify compiler\n";
         send_u32(client_fd, 0);
-        close(client_fd);
+
         return;
     }
 
@@ -628,7 +628,7 @@ void handle_client(int client_fd) {
         )) {
         std::cerr << "Could not create cache manifest\n";
         send_u32(client_fd, 0);
-        close(client_fd);
+
         return;
     }
 
@@ -640,7 +640,7 @@ void handle_client(int client_fd) {
         )) {
         std::cerr << "Could not compute cache key\n";
         send_u32(client_fd, 0);
-        close(client_fd);
+
         return;
     }
 
@@ -718,7 +718,7 @@ void handle_client(int client_fd) {
                 << '\n';
 
             send_u32(client_fd, 0);
-            close(client_fd);
+
             return;
         }
 
@@ -794,7 +794,7 @@ void handle_client(int client_fd) {
         )) {
         std::cerr << "Could not read object file\n";
         send_u32(client_fd, 0);
-        close(client_fd);
+
         return;
     }
 
@@ -802,7 +802,7 @@ void handle_client(int client_fd) {
             client_fd,
             1
         )) {
-        close(client_fd);
+
         return;
     }
 
@@ -810,7 +810,7 @@ void handle_client(int client_fd) {
             client_fd,
             relative_object.generic_string()
         )) {
-        close(client_fd);
+
         return;
     }
 
@@ -820,7 +820,7 @@ void handle_client(int client_fd) {
                 object_data.size()
             )
         )) {
-        close(client_fd);
+
         return;
     }
 
@@ -832,7 +832,7 @@ void handle_client(int client_fd) {
             object_data.size()
         )
     ) {
-        close(client_fd);
+
         return;
     }
 
@@ -848,7 +848,7 @@ void handle_client(int client_fd) {
 
     std::cout << '\n';
 
-    close(client_fd);
+
 }
 
 class ThreadPool {
@@ -929,7 +929,13 @@ private:
                 jobs_.pop();
             }
 
-            handle_client(client_fd);
+            try {
+                handle_client(client_fd);
+            } catch (const std::exception& error) {
+                std::cerr << "Job failed: " << error.what() << '\n';
+            } catch (...) {
+                std::cerr << "Job failed with an unknown error\n";
+            }
         }
     }
 
@@ -1064,8 +1070,9 @@ int main() {
         if (!pool.submit(client_fd)) {
             std::cerr
                 << "Job queue full - rejecting connection\n";
-
             close(client_fd);
+
+
         }
     }
 

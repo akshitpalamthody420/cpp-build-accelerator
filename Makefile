@@ -5,10 +5,10 @@ CXXFLAGS := -std=c++20 -pthread
 
 all: forge-client forge-worker
 
-forge-client: forge-client.cpp
+forge-client: forge-client.cpp job-support.h
 	$(CXX) $(CXXFLAGS) $< -o $@
 
-forge-worker: forge-worker.cpp
+forge-worker: forge-worker.cpp job-support.h
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 clean:
